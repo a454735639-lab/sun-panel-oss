@@ -1,0 +1,6 @@
+node_modules/
+dist/
+service/sun-panel-build
+service/assets/bindata.go
+*.log
+master.tgz

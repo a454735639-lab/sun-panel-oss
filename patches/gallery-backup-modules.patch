@@ -1,0 +1,1956 @@
+--- a/service/models/file.go
++++ b/service/models/file.go
+@@ -2,17 +2,19 @@
+ 
+ type File struct {
+ 	BaseModel
+-	Src      string `json:"src"`
+-	UserId   uint   `json:"userId"`
+-	FileName string `json:"fileName" gorm:"varchar(255)"` // 文件名
+-	Type     int    `gorm:"tinyint(1)" json:"type"`       // 文件类型 1.壁纸 2.卡片图标
+-	Ext      string `gorm:"varchar(255)" json:"ext"`      // 扩展名
++	Src             string `json:"src"`
++	UserId          uint   `json:"userId"`
++	FileName        string `json:"fileName" gorm:"varchar(255)"`         // 文件名
++	Type            int    `gorm:"tinyint(1)" json:"type"`               // 文件类型 1.壁纸 2.卡片图标 3.图库图片
++	Ext             string `gorm:"varchar(255)" json:"ext"`              // 扩展名
++	IsPublicGallery bool   `json:"isPublicGallery" gorm:"default:false"` // 是否公开到公共图库
+ }
+ 
+ const (
+ 	FileTypeUnknown = iota
+ 	FileTypeWallpaper
+ 	FileTypeCardIcon
++	FileTypeGalleryImg
+ )
+ 
+ // 添加一个文件记录
+--- a/service/lib/file/base.go
++++ b/service/lib/file/base.go
+@@ -0,0 +1,61 @@
++package file
++
++import (
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++)
++
++// CopyFile 复制单个文件（dst 的父目录需已存在或由 CopyDir 创建）
++func CopyFile(src, dst string) error {
++	in, err := os.Open(src)
++	if err != nil {
++		return fmt.Errorf("open src %s: %w", src, err)
++	}
++	defer in.Close()
++
++	if err := os.MkdirAll(filepath.Dir(dst), os.ModePerm); err != nil {
++		return fmt.Errorf("mkdir %s: %w", filepath.Dir(dst), err)
++	}
++
++	out, err := os.Create(dst)
++	if err != nil {
++		return fmt.Errorf("create dst %s: %w", dst, err)
++	}
++	defer out.Close()
++
++	if _, err = io.Copy(out, in); err != nil {
++		return fmt.Errorf("copy %s -> %s: %w", src, dst, err)
++	}
++	return out.Sync()
++}
++
++// CopyDir 递归复制目录（src 内的相对路径在 dst 下保持不变）
++func CopyDir(src, dst string) error {
++	info, err := os.Stat(src)
++	if err != nil {
++		return fmt.Errorf("stat %s: %w", src, err)
++	}
++	if !info.IsDir() {
++		return CopyFile(src, dst)
++	}
++
++	return filepath.Walk(src, func(p string, fi os.FileInfo, err error) error {
++		if err != nil {
++			return err
++		}
++		rel, err := filepath.Rel(src, p)
++		if err != nil {
++			return err
++		}
++		target := filepath.Join(dst, rel)
++		if fi.IsDir() {
++			return os.MkdirAll(target, os.ModePerm)
++		}
++		if !fi.Mode().IsRegular() {
++			return nil // 跳过符号链接等非常规文件
++		}
++		return CopyFile(p, target)
++	})
++}
+--- a/service/lib/file/zip.go
++++ b/service/lib/file/zip.go
+@@ -0,0 +1,133 @@
++package file
++
++import (
++	"archive/zip"
++	"fmt"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++)
++
++type ZipFile struct{}
++
++// Create 把多个「压缩包内路径 -> 本地路径」条目打包成 zip。
++// 本地路径是目录时递归收录其下所有常规文件。
++func (z *ZipFile) Create(items map[string]string, dest string) error {
++	if err := os.MkdirAll(filepath.Dir(dest), os.ModePerm); err != nil {
++		return err
++	}
++	f, err := os.Create(dest)
++	if err != nil {
++		return err
++	}
++	defer f.Close()
++
++	w := zip.NewWriter(f)
++	defer w.Close()
++
++	for arc, src := range items {
++		if err := zipWalk(w, arc, src); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func zipWalk(w *zip.Writer, arc, src string) error {
++	info, err := os.Stat(src)
++	if err != nil {
++		return fmt.Errorf("stat %s: %w", src, err)
++	}
++	if !info.IsDir() {
++		return zipAddFile(w, arc, src)
++	}
++	return filepath.Walk(src, func(p string, fi os.FileInfo, err error) error {
++		if err != nil || !fi.Mode().IsRegular() {
++			return err
++		}
++		rel, err := filepath.Rel(src, p)
++		if err != nil {
++			return err
++		}
++		return zipAddFile(w, filepath.Join(arc, rel), p)
++	})
++}
++
++func zipAddFile(w *zip.Writer, arc, src string) error {
++	in, err := os.Open(src)
++	if err != nil {
++		return err
++	}
++	defer in.Close()
++
++	hdr, err := zip.FileInfoHeader(mustStat(src))
++	if err != nil {
++		return err
++	}
++	hdr.Name = filepath.ToSlash(arc)
++	hdr.Method = zip.Deflate
++
++	out, err := w.CreateHeader(hdr)
++	if err != nil {
++		return err
++	}
++	_, err = io.Copy(out, in)
++	return err
++}
++
++func mustStat(p string) os.FileInfo {
++	fi, err := os.Stat(p)
++	if err != nil {
++		panic(err) // 调用方已 Stat 过，理论不可达
++	}
++	return fi
++}
++
++// Extract 解压 zip 到 destDir，保留包内相对路径；拒绝包含 .. 的条目。
++func (z *ZipFile) Extract(zipPath, destDir string) error {
++	r, err := zip.OpenReader(zipPath)
++	if err != nil {
++		return err
++	}
++	defer r.Close()
++
++	if err := os.MkdirAll(destDir, os.ModePerm); err != nil {
++		return err
++	}
++
++	for _, f := range r.File {
++		name := filepath.Clean(f.Name)
++		if strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
++			return fmt.Errorf("illegal zip entry: %s", f.Name)
++		}
++		target := filepath.Join(destDir, name)
++
++		if f.FileInfo().IsDir() {
++			if err := os.MkdirAll(target, os.ModePerm); err != nil {
++				return err
++			}
++			continue
++		}
++		if err := os.MkdirAll(filepath.Dir(target), os.ModePerm); err != nil {
++			return err
++		}
++
++		in, err := f.Open()
++		if err != nil {
++			return err
++		}
++		out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, f.Mode())
++		if err != nil {
++			in.Close()
++			return err
++		}
++		_, err = io.Copy(out, in)
++		in.Close()
++		out.Close()
++		if err != nil {
++			return err
++		}
++	}
++	return nil
++}
+--- a/service/biz/backup.go
++++ b/service/biz/backup.go
+@@ -0,0 +1,305 @@
++package biz
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strconv"
++	"strings"
++	"time"
++
++	"sun-panel/global"
++	"sun-panel/initialize/database"
++	"sun-panel/lib/cmn"
++	"sun-panel/lib/file"
++	"sun-panel/models"
++
++	"gorm.io/driver/sqlite"
++	"gorm.io/gorm"
++	"gorm.io/gorm/schema"
++)
++
++// ---------- 备份配置（与镜像 v1.8.1 字段一致） ----------
++
++type BackupConfigPath struct {
++	Uploads     string `json:"uploads"`
++	CustomStyle string `json:"customStyle"`
++	Sqlite      string `json:"sqlite"`
++}
++
++type BackupConfig struct {
++	Name                  string           `json:"name"`
++	ConfigVersion         string           `json:"configVersion"`
++	SunPanelVersion       string           `json:"sunPanelVersion"`
++	SunPanelLowestVersion string           `json:"sunPanelLowestVersion"`
++	Time                  string           `json:"time"`
++	Paths                 BackupConfigPath `json:"paths"`
++}
++
++const (
++	BackupConfigVersion          = "1.0"
++	BackupDirName                = "runtime/backup" // 备份 zip 落盘目录（相对工作目录）
++	BackupTempDir                = "runtime/temp/backup"
++	BackupConfigFileName         = "backup.json"
++	ErrBackupIncompatibleVersion = "backup version incompatible"
++)
++
++// ---------- 版本比较 ----------
++
++// parseVersion 取 "1.8.1-beta25" / "20|1.8.1" 中的数字版本段 [major, minor, patch]
++func parseVersion(v string) []int {
++	v = strings.TrimSpace(v)
++	if i := strings.Index(v, "|"); i >= 0 {
++		v = v[i+1:]
++	}
++	// 截掉首段数字之后的非数字尾巴（如 -beta25）
++	if i := strings.IndexAny(v, "-+"); i >= 0 {
++		v = v[:i]
++	}
++	parts := strings.Split(v, ".")
++	nums := make([]int, 3)
++	for j := 0; j < 3 && j < len(parts); j++ {
++		nums[j], _ = strconv.Atoi(strings.TrimSpace(parts[j]))
++	}
++	return nums
++}
++
++func versionLess(a, b []int) bool {
++	for i := 0; i < 3; i++ {
++		if a[i] != b[i] {
++			return a[i] < b[i]
++		}
++	}
++	return false
++}
++
++// VersionCompatibilityCheck 判断备份能否恢复：
++//
++//	备份版本 <= 当前版本：直接可恢复；
++//	备份版本 >  当前版本：若 lowestVersion <= 当前版本，返回 compatible=true 且 newer=true（由调用方决定是否强制）；
++//	否则不可恢复。
++func VersionCompatibilityCheck(cfg BackupConfig) (compatible, newer bool, err error) {
++	cur := parseVersion(cmn.GetSysVersionInfo().Version)
++	backup := parseVersion(cfg.SunPanelVersion)
++	lowest := parseVersion(cfg.SunPanelLowestVersion)
++
++	switch {
++	case !versionLess(cur, backup): // cur >= backup
++		return true, false, nil
++	case cfg.SunPanelLowestVersion == "" || !versionLess(cur, lowest): // cur >= lowest
++		return true, true, nil
++	default:
++		return false, false, fmt.Errorf("%s: current %s < lowest %s",
++			ErrBackupIncompatibleVersion, cmn.GetSysVersionInfo().Version, cfg.SunPanelLowestVersion)
++	}
++}
++
++// ---------- 备份 ----------
++
++func buildBackupConfig() BackupConfig {
++	return BackupConfig{
++		Name:                  "sun-panel",
++		ConfigVersion:         BackupConfigVersion,
++		SunPanelVersion:       cmn.GetSysVersionInfo().Version,
++		SunPanelLowestVersion: cmn.GetSysVersionInfo().Version,
++		Time:                  cmn.GetTime(),
++		Paths: BackupConfigPath{
++			Uploads:     "uploads",
++			CustomStyle: "custom",
++			Sqlite:      "sqlite/database.db",
++		},
++	}
++}
++
++func saveBackupConfig(dir string, cfg BackupConfig) error {
++	data, err := json.MarshalIndent(cfg, "", "  ")
++	if err != nil {
++		return err
++	}
++	return os.WriteFile(filepath.Join(dir, BackupConfigFileName), data, 0644)
++}
++
++func loadBackupConfig(dir string) (cfg BackupConfig, err error) {
++	data, err := os.ReadFile(filepath.Join(dir, BackupConfigFileName))
++	if err != nil {
++		return
++	}
++	err = json.Unmarshal(data, &cfg)
++	return
++}
++
++// backupToTemp 把 uploads / custom / sqlite 汇总到临时目录
++func backupToTemp(tmpDir string, cfg BackupConfig) error {
++	sourcePath := global.Config.GetValueString("base", "source_path")
++	customPath := orDefault(global.Config.GetValueString("base", "custom_style_path"), "./conf/custom")
++	sqlitePath := orDefault(global.Config.GetValueString("sqlite", "file_path"), "./conf/database/database.db")
++
++	_ = cfg
++	if err := os.MkdirAll(tmpDir, os.ModePerm); err != nil {
++		return err
++	}
++	// 目录可能尚未创建（从未上传过文件/未设置自定义样式），缺失时跳过
++	if exists, _ := cmn.PathExists(sourcePath); exists {
++		if err := file.CopyDir(sourcePath, filepath.Join(tmpDir, "uploads")); err != nil {
++			return fmt.Errorf("copy uploads: %w", err)
++		}
++	}
++	if exists, _ := cmn.PathExists(customPath); exists {
++		if err := file.CopyDir(customPath, filepath.Join(tmpDir, "custom")); err != nil {
++			return fmt.Errorf("copy custom: %w", err)
++		}
++	}
++	if exists, _ := cmn.PathExists(sqlitePath); exists {
++		if err := file.CopyFile(sqlitePath, filepath.Join(tmpDir, "sqlite", "database.db")); err != nil {
++			return fmt.Errorf("copy sqlite: %w", err)
++		}
++	} else {
++		return fmt.Errorf("sqlite db not found: %s", sqlitePath)
++	}
++	return nil
++}
++
++// backupPathToZip 把临时目录压成 zip（缺失的子目录自动跳过）
++func backupPathToZip(tmpDir, zipPath string) error {
++	z := file.ZipFile{}
++	items := map[string]string{
++		"uploads":            filepath.Join(tmpDir, "uploads"),
++		"sqlite":             filepath.Join(tmpDir, "sqlite"),
++		BackupConfigFileName: filepath.Join(tmpDir, BackupConfigFileName),
++	}
++	if exists, _ := cmn.PathExists(filepath.Join(tmpDir, "custom")); exists {
++		items["custom"] = filepath.Join(tmpDir, "custom")
++	}
++	return z.Create(items, zipPath)
++}
++
++// BackupToZip 入口：备份并打包，返回文件名（不含路径）
++func BackupToZip() (fileName string, err error) {
++	cfg := buildBackupConfig()
++	ts := time.Now().Format("20060102150405")
++	fileName = fmt.Sprintf("sun-panel-backup-%s.zip", ts)
++
++	tmpDir := filepath.Join(BackupTempDir, ts)
++	defer os.RemoveAll(tmpDir)
++
++	if err = backupToTemp(tmpDir, cfg); err != nil {
++		return
++	}
++	if err = saveBackupConfig(tmpDir, cfg); err != nil {
++		return
++	}
++	zipPath := filepath.Join(BackupDirName, fileName)
++	if err = os.MkdirAll(BackupDirName, os.ModePerm); err != nil {
++		return
++	}
++	if err = backupPathToZip(tmpDir, zipPath); err != nil {
++		return
++	}
++	return
++}
++
++// ---------- 恢复 ----------
++
++// ExtractBackZip 解压上传的备份包
++func ExtractBackZip(zipPath, destDir string) error {
++	z := file.ZipFile{}
++	return z.Extract(zipPath, destDir)
++}
++
++// ExtractBackupZipAndLoadConfig 解压并读取 backup.json
++func ExtractBackupZipAndLoadConfig(zipPath string) (cfg BackupConfig, dir string, err error) {
++	dir = filepath.Join(BackupTempDir, "restore-"+time.Now().Format("20060102150405"))
++	if err = ExtractBackZip(zipPath, dir); err != nil {
++		return
++	}
++	cfg, err = loadBackupConfig(dir)
++	return
++}
++
++// deleteSqliteDatabaseImportantData 恢复场景保留：清空敏感表。
++// 当前恢复实现采用整库文件替换，仅在 mysql 等无法整库替换的场景下由调用方使用。
++func deleteSqliteDatabaseImportantData(db *gorm.DB) error {
++	for _, table := range []string{"open_api_token", "user_config", "file"} {
++		if err := db.Exec(fmt.Sprintf("DELETE FROM `%s`", table)).Error; err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++// reopenSqlite 关闭当前连接并用原配置重新打开 sqlite
++func reopenSqlite(filePath string) error {
++	if sqlDB, err := global.Db.DB(); err == nil {
++		_ = sqlDB.Close()
++	}
++	db, err := gorm.Open(sqlite.Open(filePath), &gorm.Config{
++		Logger:                                   database.GetLogger(),
++		NamingStrategy:                           schema.NamingStrategy{SingularTable: true},
++		DisableForeignKeyConstraintWhenMigrating: true,
++	})
++	if err != nil {
++		return err
++	}
++	// 同时更新两处全局句柄，避免残留已关闭的旧连接
++	global.Db = db
++	models.Db = db
++	return nil
++}
++
++// Recovery 恢复备份：sqlite 整库替换 + 还原 uploads / custom。
++// force=false 且备份版本比当前新（但兼容）时返回 lowestSunPanelVersion 供前端确认。
++func Recovery(zipPath string, force bool) (needConfirm bool, lowestSunPanelVersion string, err error) {
++	cfg, dir, err := ExtractBackupZipAndLoadConfig(zipPath)
++	if err != nil {
++		return
++	}
++	defer os.RemoveAll(dir)
++
++	compatible, newer, cerr := VersionCompatibilityCheck(cfg)
++	if cerr != nil {
++		return false, cfg.SunPanelLowestVersion, cerr
++	}
++	if !compatible {
++		return false, cfg.SunPanelLowestVersion, fmt.Errorf("%s", ErrBackupIncompatibleVersion)
++	}
++	if newer && !force {
++		return true, cfg.SunPanelLowestVersion, nil
++	}
++
++	// 1) sqlite 整库替换
++	if strings.EqualFold(orDefault(global.Config.GetValueString("base", "database_drive"), "sqlite"), "sqlite") {
++		sqlitePath := orDefault(global.Config.GetValueString("sqlite", "file_path"), "./conf/database/database.db")
++		if err = reopenSqlite(sqlitePath); err != nil {
++			return
++		}
++		if err = file.CopyFile(filepath.Join(dir, cfg.Paths.Sqlite), sqlitePath); err != nil {
++			return
++		}
++		if err = reopenSqlite(sqlitePath); err != nil {
++			return
++		}
++	}
++
++	// 2) 还原 uploads（备份包里可能没有该目录）
++	sourcePath := global.Config.GetValueString("base", "source_path")
++	if exists, _ := cmn.PathExists(filepath.Join(dir, cfg.Paths.Uploads)); exists {
++		if err = file.CopyDir(filepath.Join(dir, cfg.Paths.Uploads), sourcePath); err != nil {
++			return
++		}
++	}
++
++	// 3) 还原 custom（同上，可能缺失）
++	customPath := orDefault(global.Config.GetValueString("base", "custom_style_path"), "./conf/custom")
++	if exists, _ := cmn.PathExists(filepath.Join(dir, cfg.Paths.CustomStyle)); exists {
++		err = file.CopyDir(filepath.Join(dir, cfg.Paths.CustomStyle), customPath)
++	}
++	return
++}
++
++func orDefault(v, def string) string {
++	if v == "" {
++		return def
++	}
++	return v
++}
+--- a/service/api/api_v1/panel/gallery.go
++++ b/service/api/api_v1/panel/gallery.go
+@@ -0,0 +1,80 @@
++package panel
++
++import (
++	"sun-panel/api/api_v1/common/apiReturn"
++	"sun-panel/api/api_v1/common/base"
++	"sun-panel/models"
++
++	"github.com/gin-gonic/gin"
++)
++
++type GalleryApi struct{}
++
++// GetUserImagesList 当前用户的图库/上传图片列表
++// POST /panel/gallery/getUserImagesList {"page":1,"pageSize":20,"type":null}
++func (a *GalleryApi) GetUserImagesList(c *gin.Context) {
++	userInfo, _ := base.GetCurrentUserInfo(c)
++
++	req := struct {
++		Page     int  `json:"page"`
++		PageSize int  `json:"pageSize"`
++		Type     *int `json:"type"`
++	}{}
++	if err := c.ShouldBindJSON(&req); err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++	if req.Page <= 0 {
++		req.Page = 1
++	}
++	if req.PageSize <= 0 || req.PageSize > 200 {
++		req.PageSize = 20
++	}
++
++	db := models.Db.Model(&models.File{}).Where("user_id = ?", userInfo.ID)
++	if req.Type != nil {
++		db = db.Where("type = ?", *req.Type)
++	}
++
++	var count int64
++	if err := db.Count(&count).Error; err != nil {
++		apiReturn.ErrorDatabase(c, err.Error())
++		return
++	}
++
++	var files []models.File
++	if err := db.Order("created_at desc").
++		Offset((req.Page - 1) * req.PageSize).Limit(req.PageSize).
++		Find(&files).Error; err != nil {
++		apiReturn.ErrorDatabase(c, err.Error())
++		return
++	}
++
++	apiReturn.SuccessListData(c, files, count)
++}
++
++// UpdateFileType 修改文件类型（如把图库图片设为壁纸）
++// POST /panel/gallery/updateFileType {"id":1,"type":1}
++func (a *GalleryApi) UpdateFileType(c *gin.Context) {
++	userInfo, _ := base.GetCurrentUserInfo(c)
++
++	req := struct {
++		ID   uint `json:"id"`
++		Type int  `json:"type"`
++	}{}
++	if err := c.ShouldBindJSON(&req); err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++
++	mFile := models.File{}
++	if err := models.Db.Where("id = ? and user_id = ?", req.ID, userInfo.ID).First(&mFile).Error; err != nil {
++		apiReturn.ErrorDataNotFound(c)
++		return
++	}
++	if err := models.Db.Model(&mFile).Update("type", req.Type).Error; err != nil {
++		apiReturn.ErrorDatabase(c, err.Error())
++		return
++	}
++	apiReturn.SuccessData(c, mFile)
++}
+--- a/service/api/api_v1/panel/publicGallery.go
++++ b/service/api/api_v1/panel/publicGallery.go
+@@ -0,0 +1,127 @@
++package panel
++
++import (
++	"sun-panel/api/api_v1/common/apiReturn"
++	"sun-panel/api/api_v1/common/base"
++	"sun-panel/global"
++	"sun-panel/models"
++
++	"github.com/gin-gonic/gin"
++)
++
++type PublicGalleryApi struct{}
++
++var publicGalleryAgreeExts = []string{
++	".png", ".jpg", ".gif", ".jpeg", ".webp", ".svg", ".ico", ".avif", ".heic",
++}
++
++// GetImagesList 公共图库列表
++// POST /panel/publicGallery/getImagesList {"page":1,"pageSize":20}
++func (a *PublicGalleryApi) GetImagesList(c *gin.Context) {
++	req := struct {
++		Page     int `json:"page"`
++		PageSize int `json:"pageSize"`
++	}{}
++	if err := c.ShouldBindJSON(&req); err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++	if req.Page <= 0 {
++		req.Page = 1
++	}
++	if req.PageSize <= 0 || req.PageSize > 200 {
++		req.PageSize = 20
++	}
++
++	db := models.Db.Model(&models.File{}).Where("is_public_gallery = ?", true)
++
++	var count int64
++	if err := db.Count(&count).Error; err != nil {
++		apiReturn.ErrorDatabase(c, err.Error())
++		return
++	}
++
++	var files []models.File
++	if err := db.Order("created_at desc").
++		Offset((req.Page - 1) * req.PageSize).Limit(req.PageSize).
++		Find(&files).Error; err != nil {
++		apiReturn.ErrorDatabase(c, err.Error())
++		return
++	}
++
++	apiReturn.SuccessListData(c, files, count)
++}
++
++// UploadImg 上传图片到公共图库
++// POST /api/panel/publicGallery/uploadImg  multipart: imgfile, type(可选)
++func (a *PublicGalleryApi) UploadImg(c *gin.Context) {
++	fileInfo, err := base.UploadFileAndSave(c, publicGalleryAgreeExts, 0)
++	if err != nil {
++		switch err {
++		case base.ErrUploadExtensionNameNotAllowed:
++			apiReturn.ErrorByCode(c, apiReturn.ErrCodeUnsupportedFileFormat)
++		default:
++			global.Logger.Error(err.Error())
++			apiReturn.ErrorByCode(c, apiReturn.ErrCodeUploadFailed)
++		}
++		return
++	}
++
++	// 标记为图库图片并公开
++	fileInfo.Type = models.FileTypeGalleryImg
++	fileInfo.IsPublicGallery = true
++	if err := models.Db.Model(&models.File{}).Where("id = ?", fileInfo.ID).
++		Updates(map[string]interface{}{"type": fileInfo.Type, "is_public_gallery": true}).Error; err != nil {
++		apiReturn.ErrorDatabase(c, err.Error())
++		return
++	}
++
++	apiReturn.SuccessData(c, fileInfo)
++}
++
++// Deletes 从公共图库删除
++// POST /panel/publicGallery/deletes {"ids":[1,2]}
++func (a *PublicGalleryApi) Deletes(c *gin.Context) {
++	req := struct {
++		IDs []uint `json:"ids"`
++	}{}
++	if err := c.ShouldBindJSON(&req); err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++	if len(req.IDs) == 0 {
++		apiReturn.ErrorParamFomat(c, "ids is empty")
++		return
++	}
++
++	if err := models.Db.Where("id in ? and is_public_gallery = ?", req.IDs, true).
++		Delete(&models.File{}).Error; err != nil {
++		apiReturn.ErrorDatabase(c, err.Error())
++		return
++	}
++	apiReturn.Success(c)
++}
++
++// UpdateFileType 修改公共图库文件的类型（管理员）
++// POST /panel/publicGallery/updateFileType {"id":1,"type":1}
++func (a *PublicGalleryApi) UpdateFileType(c *gin.Context) {
++	req := struct {
++		ID   uint `json:"id"`
++		Type int  `json:"type"`
++	}{}
++	if err := c.ShouldBindJSON(&req); err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++
++	mFile := models.File{}
++	if err := models.Db.Where("id = ?", req.ID).First(&mFile).Error; err != nil {
++		apiReturn.ErrorDataNotFound(c)
++		return
++	}
++	if err := models.Db.Model(&mFile).Update("type", req.Type).Error; err != nil {
++		apiReturn.ErrorDatabase(c, err.Error())
++		return
++	}
++	apiReturn.SuccessData(c, mFile)
++}
+--- a/service/api/api_v1/panel/backup.go
++++ b/service/api/api_v1/panel/backup.go
+@@ -0,0 +1,117 @@
++package panel
++
++import (
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"time"
++
++	"sun-panel/api/api_v1/common/apiReturn"
++	"sun-panel/biz"
++	"sun-panel/global"
++
++	"github.com/gin-gonic/gin"
++)
++
++type BackupApi struct{}
++
++var backupAgreeExts = []string{".zip"}
++
++func backupSavePath(fileName string) string {
++	return filepath.Join(biz.BackupDirName, filepath.Base(fileName))
++}
++
++// Backup 执行备份并返回文件名
++// POST /panel/backup/backup
++func (a *BackupApi) Backup(c *gin.Context) {
++	fileName, err := biz.BackupToZip()
++	if err != nil {
++		global.Logger.Error(err.Error())
++		apiReturn.Error(c, err.Error())
++		return
++	}
++	apiReturn.SuccessData(c, gin.H{"fileName": fileName})
++}
++
++// DownloadBackupZIPFile 下载备份包
++// GET /api/panel/backup/downloadBackupZIPFile?fileName=xxx.zip
++func (a *BackupApi) DownloadBackupZIPFile(c *gin.Context) {
++	fileName := c.Query("fileName")
++	if fileName == "" || strings.Contains(fileName, "..") || strings.Contains(fileName, "/") {
++		apiReturn.ErrorParamFomat(c, "illegal fileName")
++		return
++	}
++	zipPath := backupSavePath(fileName)
++	if _, err := os.Stat(zipPath); err != nil {
++		apiReturn.ErrorDataNotFound(c)
++		return
++	}
++	c.FileAttachment(zipPath, fileName)
++}
++
++// UploadZipFile 上传备份包（不自动恢复）
++// POST /api/panel/backup/uploadZipFile  multipart: imgfile
++func (a *BackupApi) UploadZipFile(c *gin.Context) {
++	f, err := c.FormFile("imgfile")
++	if err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++	if !containsExt(backupAgreeExts, f.Filename) {
++		apiReturn.ErrorByCode(c, apiReturn.ErrCodeUnsupportedFileFormat)
++		return
++	}
++
++	if err := os.MkdirAll(biz.BackupDirName, os.ModePerm); err != nil {
++		apiReturn.Error(c, err.Error())
++		return
++	}
++	fileName := fmt.Sprintf("upload-%s.zip", time.Now().Format("20060102150405"))
++	if err := c.SaveUploadedFile(f, backupSavePath(fileName)); err != nil {
++		apiReturn.Error(c, err.Error())
++		return
++	}
++	apiReturn.SuccessData(c, gin.H{"fileName": fileName})
++}
++
++// Recovery 恢复备份
++// POST /panel/backup/recovery {"fileName":"xxx.zip","force":false}
++func (a *BackupApi) Recovery(c *gin.Context) {
++	req := struct {
++		FileName string `json:"fileName"`
++		Force    bool   `json:"force"`
++	}{}
++	if err := c.ShouldBindJSON(&req); err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++	if req.FileName == "" || strings.Contains(req.FileName, "..") || strings.Contains(req.FileName, "/") {
++		apiReturn.ErrorParamFomat(c, "illegal fileName")
++		return
++	}
++
++	needConfirm, lowest, err := biz.Recovery(backupSavePath(req.FileName), req.Force)
++	if err != nil {
++		global.Logger.Error(err.Error())
++		// 版本不兼容：data 里带 lowestSunPanelVersion，前端弹确认框
++		apiReturn.ErrorCode(c, 1002, err.Error(), gin.H{"lowestSunPanelVersion": lowest})
++		return
++	}
++	if needConfirm && !req.Force {
++		apiReturn.ErrorCode(c, 1002, "recoveryFileVersionNewerButCompatible",
++			gin.H{"lowestSunPanelVersion": lowest})
++		return
++	}
++	apiReturn.SuccessData(c, gin.H{"fileName": req.FileName})
++}
++
++func containsExt(exts []string, name string) bool {
++	lower := strings.ToLower(name)
++	for _, e := range exts {
++		if strings.HasSuffix(lower, e) {
++			return true
++		}
++	}
++	return false
++}
+--- a/service/api/api_v1/panel/A_ENTER.go
++++ b/service/api/api_v1/panel/A_ENTER.go
+@@ -7,4 +7,7 @@
+ 	ItemIconGroup    ItemIconGroup
+ 	ProAuthApi       ProAuthApi
+ 	GlobalSettingApi GlobalSettingApi
++	GalleryApi       GalleryApi
++	PublicGalleryApi PublicGalleryApi
++	BackupApi        BackupApi
+ }
+--- a/service/api/api_v1/panel/globalSetting.go
++++ b/service/api/api_v1/panel/globalSetting.go
+@@ -137,6 +137,43 @@
+ 	apiReturn.Success(c)
+ }
+ 
++// SaveCustomStyleCodeOss oss 原生实现：保存自定义 JS/CSS。
++// 与 Pro 版 saveCustomJsAndCssCode 行为一致，但不做 Pro 授权校验；
++// 原 Pro 端点保持原样，购买 Pro 后仍可继续使用。
++func (a *GlobalSettingApi) SaveCustomStyleCodeOss(c *gin.Context) {
++	customPath := a.getCustomPath()
++
++	if ok, err := cmn.PathExists(customPath); err != nil || !ok {
++		if err := os.MkdirAll(customPath, os.ModePerm); err != nil {
++			apiReturn.ErrorByCode(c, apiReturn.ErrCodeCustomJSAndCSSFilePreservationFailure)
++			global.Logger.Errorln("failure to create a custom directory failed:", customPath, " - ", err.Error())
++			return
++		}
++	}
++
++	req := panelApiStructs.GlobalSettingCustomJsAndCss{}
++	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++
++	cssFilePath := customPath + "/index.css"
++	if err := createAndWriteFile(cssFilePath, req.CssContent); err != nil {
++		apiReturn.ErrorByCode(c, apiReturn.ErrCodeCustomJSAndCSSFilePreservationFailure)
++		global.Logger.Errorln("createAndWriteFile:", cssFilePath, " - ", err.Error())
++		return
++	}
++
++	jsFilePath := customPath + "/index.js"
++	if err := createAndWriteFile(jsFilePath, req.JsContent); err != nil {
++		apiReturn.ErrorByCode(c, apiReturn.ErrCodeCustomJSAndCSSFilePreservationFailure)
++		global.Logger.Errorln("createAndWriteFile:", jsFilePath, " - ", err.Error())
++		return
++	}
++
++	apiReturn.Success(c)
++}
++
+ // 创建并写入文件的函数
+ func createAndWriteFile(filename, content string) error {
+ 	// 创建文件，如果文件已存在则会被覆盖
+--- a/service/api/api_v1/docker/container.go
++++ b/service/api/api_v1/docker/container.go
+@@ -7,6 +7,7 @@
+ 	"sun-panel/biz"
+ 	"sun-panel/lib/cmn"
+ 	"sun-panel/lib/docker"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/docker/docker/api/types"
+@@ -17,6 +18,39 @@
+ )
+ 
+ type Container struct {
++}
++
++// SwitchStateByContainerID oss 原生实现：按 ID 启动/停止容器。
++// 与 Pro 版 execSwitchActionByContainerID 行为一致，但不做 Pro 授权校验；
++// 原 Pro 端点保持原样，购买 Pro 后仍可继续使用。
++func (a *Container) SwitchStateByContainerID(c *gin.Context) {
++	req := dockerApiStructs.ExecSwitchActionByContainerIDReq{}
++
++	if err := c.ShouldBindBodyWith(&req, binding.JSON); err != nil {
++		apiReturn.ErrorParamFomat(c, err.Error())
++		return
++	}
++
++	client, err := docker.NewDockerClient()
++	if err != nil {
++		apiReturn.ErrorDockerClientFail(c, err.Error())
++		return
++	}
++	defer client.Close()
++
++	ctx := context.Background()
++
++	if req.Action {
++		err = client.ContainerStart(ctx, req.ID, container.StartOptions{})
++	} else {
++		err = client.ContainerStop(ctx, req.ID, container.StopOptions{})
++	}
++
++	if err != nil {
++		apiReturn.ErrorDocker(c, err.Error())
++		return
++	}
++	apiReturn.Success(c)
+ }
+ 
+ func (a *Container) GetList(c *gin.Context) {
+@@ -152,6 +186,8 @@
+ }
+ 
+ // 获取多个容器的状态
++// oss 优化：并发采集 + 5 秒结果缓存。原先串行对每个容器新建 client 做 inspect+stats，
++// 20+ 个容器时单次请求要 1.5-2 秒，前端每 5 秒轮询一次会一直占着连接。
+ func (a *Container) GetContainersState(c *gin.Context) {
+ 	reqIds := []string{}
+ 
+@@ -161,38 +197,78 @@
+ 	}
+ 
+ 	resp := map[string]dockerApiStructs.ContainerStats{}
++	now := time.Now()
++
++	var (
++		mu  sync.Mutex
++		wg  sync.WaitGroup
++		sem = make(chan struct{}, 8) // 并发上限，避免把 docker daemon 打满
++	)
+ 
+ 	for _, v := range reqIds {
+-		temp := dockerApiStructs.ContainerStats{}
+-		inspectData, err := biz.Docker.GetContainerInspect(v)
+-		temp.RunStatus = inspectData.Status
+-		temp.ShotTime = time.Now()
++		if cached, ok := containerStatsCache.Load(v); ok {
++			if entry, ok := cached.(cachedContainerStats); ok && now.Sub(entry.at) < containerStatsCacheTTL {
++				resp[v] = entry.data
++				continue
++			}
++		}
++
++		wg.Add(1)
++		go func(id string) {
++			defer wg.Done()
++			sem <- struct{}{}
++			defer func() { <-sem }()
++
++			state := collectContainerState(id)
++			containerStatsCache.Store(id, cachedContainerStats{data: state, at: time.Now()})
++
++			mu.Lock()
++			resp[id] = state
++			mu.Unlock()
++		}(v)
++	}
++	wg.Wait()
++
++	apiReturn.SuccessData(c, resp)
++}
++
++type cachedContainerStats struct {
++	data dockerApiStructs.ContainerStats
++	at   time.Time
++}
++
++var (
++	containerStatsCache    sync.Map
++	containerStatsCacheTTL = 5 * time.Second
++)
++
++// collectContainerState 采集单个容器的运行状态与资源用量
++func collectContainerState(containerID string) dockerApiStructs.ContainerStats {
++	temp := dockerApiStructs.ContainerStats{}
++	inspectData, err := biz.Docker.GetContainerInspect(containerID)
++	temp.ShotTime = time.Now()
++	if err != nil {
++		temp.RunStatus = "error"
++		temp.ErrorMassage = err.Error()
++		return temp
++	}
++	temp.RunStatus = inspectData.Status
++
++	if inspectData.Status == "running" {
++		stateData, err := biz.Docker.GetContainerState(containerID)
+ 		if err != nil {
+-			temp.RunStatus = "error"
+ 			temp.ErrorMassage = err.Error()
+-			resp[v] = temp
+-			continue
++			return temp
+ 		}
+-
+-		if inspectData.Status == "running" {
+-			stateData, err := biz.Docker.GetContainerState(v)
+-			if err != nil {
+-				temp.ErrorMassage = err.Error()
+-			}
+-			temp.CPUPercent = stateData.CPUPercent
+-			temp.Memory = stateData.Memory
+-			temp.Cache = stateData.Cache
+-			temp.IORead = stateData.IORead
+-			temp.IOWrite = stateData.IOWrite
+-			temp.NetworkRX = stateData.NetworkRX
+-			temp.NetworkTX = stateData.NetworkTX
+-
+-		}
+-		resp[v] = temp
+-	}
+-
+-	apiReturn.SuccessData(c, resp)
+-
++		temp.CPUPercent = stateData.CPUPercent
++		temp.Memory = stateData.Memory
++		temp.Cache = stateData.Cache
++		temp.IORead = stateData.IORead
++		temp.IOWrite = stateData.IOWrite
++		temp.NetworkRX = stateData.NetworkRX
++		temp.NetworkTX = stateData.NetworkTX
++	}
++	return temp
+ }
+ 
+ type ContainerGetContainerIDByNameReq struct {
+--- a/service/router/panel/gallery.go
++++ b/service/router/panel/gallery.go
+@@ -0,0 +1,17 @@
++package panel
++
++import (
++	"sun-panel/api/api_v1"
++	"sun-panel/api/api_v1/middleware"
++
++	"github.com/gin-gonic/gin"
++)
++
++func InitGallery(router *gin.RouterGroup) {
++	gallery := api_v1.ApiGroupApp.ApiPanel.GalleryApi
++	r := router.Group("", middleware.LoginInterceptor)
++	{
++		r.POST("/panel/gallery/getUserImagesList", gallery.GetUserImagesList)
++		r.POST("/panel/gallery/updateFileType", gallery.UpdateFileType)
++	}
++}
+--- a/service/router/panel/publicGallery.go
++++ b/service/router/panel/publicGallery.go
+@@ -0,0 +1,25 @@
++package panel
++
++import (
++	"sun-panel/api/api_v1"
++	"sun-panel/api/api_v1/middleware"
++
++	"github.com/gin-gonic/gin"
++)
++
++func InitPublicGallery(router *gin.RouterGroup) {
++	publicGallery := api_v1.ApiGroupApp.ApiPanel.PublicGalleryApi
++
++	// 列表登录即可见；上传/删除/改类型仅管理员
++	r := router.Group("", middleware.LoginInterceptor)
++	{
++		r.POST("/panel/publicGallery/getImagesList", publicGallery.GetImagesList)
++	}
++
++	rAdmin := router.Group("", middleware.LoginInterceptor, middleware.AdminInterceptor)
++	{
++		rAdmin.POST("/panel/publicGallery/uploadImg", publicGallery.UploadImg)
++		rAdmin.POST("/panel/publicGallery/deletes", publicGallery.Deletes)
++		rAdmin.POST("/panel/publicGallery/updateFileType", publicGallery.UpdateFileType)
++	}
++}
+--- a/service/router/panel/backup.go
++++ b/service/router/panel/backup.go
+@@ -0,0 +1,20 @@
++package panel
++
++import (
++	"sun-panel/api/api_v1"
++	"sun-panel/api/api_v1/middleware"
++
++	"github.com/gin-gonic/gin"
++)
++
++func InitBackupRouter(router *gin.RouterGroup) {
++	backup := api_v1.ApiGroupApp.ApiPanel.BackupApi
++
++	rAdmin := router.Group("", middleware.LoginInterceptor, middleware.AdminInterceptor)
++	{
++		rAdmin.POST("/panel/backup/backup", backup.Backup)
++		rAdmin.POST("/panel/backup/recovery", backup.Recovery)
++		rAdmin.POST("/panel/backup/uploadZipFile", backup.UploadZipFile)
++		rAdmin.GET("/panel/backup/downloadBackupZIPFile", backup.DownloadBackupZIPFile)
++	}
++}
+--- a/service/router/panel/A_ENTER.go
++++ b/service/router/panel/A_ENTER.go
+@@ -9,4 +9,7 @@
+ 	InitItemIconGroup(routerGroup)
+ 	InitProAuthRouter(routerGroup)
+ 	InitGetSiteStting(routerGroup)
++	InitGallery(routerGroup)
++	InitPublicGallery(routerGroup)
++	InitBackupRouter(routerGroup)
+ }
+--- a/service/router/panel/globalSetting.go
++++ b/service/router/panel/globalSetting.go
+@@ -15,6 +15,8 @@
+ 		r.POST("/panel/globalSetting/uploadFaviconImage", api.UploadFaviconImage)
+ 		r.POST("/panel/globalSetting/getCustomStylePath", api.GetCustomStylePath)
+ 		r.POST("/panel/globalSetting/saveCustomJsAndCssCode", api.SaveCustomJsAndCssCode)
++		// oss 原生实现（不做 Pro 校验），前端默认走这条
++		r.POST("/panel/globalSetting/saveCustomStyleCodeOss", api.SaveCustomStyleCodeOss)
+ 		r.POST("/panel/globalSetting/getCustomJsAndCssCode", api.GetCustomJsAndCssCode)
+ 	}
+ 
+--- a/service/router/docker/container.go
++++ b/service/router/docker/container.go
+@@ -15,6 +15,8 @@
+ 	{
+ 		r.POST("/docker/container/getList", apiDocker.Container.GetList)
+ 		r.POST("/docker/container/execSwitchActionByContainerID", apiDocker.Container.ExecSwitchActionByContainerID)
++		// oss 原生实现（不做 Pro 校验），前端默认走这条
++		r.POST("/docker/container/switchState", apiDocker.Container.SwitchStateByContainerID)
+ 		r.POST("/docker/container/getContainerIDByName", apiDocker.Container.GetContainerIDByName)
+ 	}
+ 
+--- a/service/assets/version
++++ b/service/assets/version
+@@ -1 +1 @@
+-20|1.7.0-beta25-03-20
+\ No newline at end of file
++20|1.8.1-oss
+--- a/src/api/panel/gallery.ts
++++ b/src/api/panel/gallery.ts
+@@ -0,0 +1,71 @@
++import { post } from '@/utils/request'
++
++export interface GalleryPageRequest {
++  page: number
++  pageSize: number
++  type?: number | null
++}
++
++export interface BackupRecoveryRequest {
++  fileName: string
++  force: boolean
++}
++
++/* ---------------- 图库 ---------------- */
++
++export function getUserImagesList<T>(data: GalleryPageRequest) {
++  return post<T>({
++    url: '/panel/gallery/getUserImagesList',
++    data,
++  })
++}
++
++export function updateGalleryFileType<T>(data: { id: number, type: number }) {
++  return post<T>({
++    url: '/panel/gallery/updateFileType',
++    data,
++  })
++}
++
++/* ---------------- 公开图库 ---------------- */
++
++export function getPublicImagesList<T>(data: GalleryPageRequest) {
++  return post<T>({
++    url: '/panel/publicGallery/getImagesList',
++    data,
++  })
++}
++
++export function deletePublicImages<T>(ids: number[]) {
++  return post<T>({
++    url: '/panel/publicGallery/deletes',
++    data: { ids },
++  })
++}
++
++export function updatePublicGalleryFileType<T>(data: { id: number, type: number }) {
++  return post<T>({
++    url: '/panel/publicGallery/updateFileType',
++    data,
++  })
++}
++
++export const publicGalleryUploadUrl = '/api/panel/publicGallery/uploadImg'
++
++/* ---------------- 备份 / 迁移 ---------------- */
++
++export function backupCreate<T>() {
++  return post<T>({
++    url: '/panel/backup/backup',
++  })
++}
++
++export function backupRecovery<T>(data: BackupRecoveryRequest) {
++  return post<T>({
++    url: '/panel/backup/recovery',
++    data,
++  })
++}
++
++export const backupUploadZipUrl = '/api/panel/backup/uploadZipFile'
++export const backupDownloadUrl = '/api/panel/backup/downloadBackupZIPFile'
+--- a/src/api/panel/globalSetting.ts
++++ b/src/api/panel/globalSetting.ts
+@@ -26,8 +26,9 @@
+ }
+ 
+ export function saveCustomJsAndCssCode<T>(data: GlobalSetting.GlobalSettingCustomJsAndCss) {
++  // oss 原生端点，与 Pro 端点行为一致（后端 /panel/globalSetting/saveCustomStyleCodeOss）
+   return post<T>({
+-    url: '/panel/globalSetting/saveCustomJsAndCssCode',
++    url: '/panel/globalSetting/saveCustomStyleCodeOss',
+     data,
+   })
+ }
+--- a/src/api/docker/container.ts
++++ b/src/api/docker/container.ts
+@@ -7,8 +7,9 @@
+ }
+ 
+ export function execSwitchAction<T>(param: Docker.Container.ExecSwitchActionReq) {
++  // oss 原生端点，与 Pro 端点行为一致（后端 /docker/container/switchState）
+   return post<T>({
+-    url: '/docker/container/execSwitchActionByContainerID',
++    url: '/docker/container/switchState',
+     data: param,
+   })
+ }
+--- a/src/components/apps/index.ts
++++ b/src/components/apps/index.ts
+@@ -1,6 +1,9 @@
+ import About from './About/index.vue'
++import BackupMigration from './BackupMigration/index.vue'
++import Gallery from './Gallery/index.vue'
+ import ImportExport from './ImportExport/index.vue'
+ import ItemGroupManage from './ItemGroupManage/index.vue'
++import PublicGallery from './PublicGallery/index.vue'
+ import Style from './Style/index.vue'
+ import UserInfo from './UserInfo/index.vue'
+ import Users from './Users/index.vue'
+@@ -9,8 +12,11 @@
+ 
+ export {
+   About,
++  BackupMigration,
++  Gallery,
+   ImportExport,
+   ItemGroupManage,
++  PublicGallery,
+   Style,
+   UserInfo,
+   Users,
+--- a/src/components/apps/Gallery/index.vue
++++ b/src/components/apps/Gallery/index.vue
+@@ -0,0 +1,140 @@
++<script setup lang="ts">
++import { NAlert, NButton, NImage, NSpin, useDialog, useMessage } from 'naive-ui'
++import { onMounted, ref } from 'vue'
++import { getUserImagesList, updateGalleryFileType } from '@/api/panel/gallery'
++import { deletes as deleteFiles } from '@/api/system/file'
++import { RoundCardModal, SvgIcon } from '@/components/common'
++import { t } from '@/locales'
++import { copyToClipboard, timeFormat } from '@/utils/cmn'
++
++const imageList = ref<File.Info[]>([])
++const loading = ref(false)
++const ms = useMessage()
++const dialog = useDialog()
++const infoModalState = ref<{ show: boolean, title: string, fileInfo: File.Info | null }>({
++  show: false,
++  title: '',
++  fileInfo: null,
++})
++
++function imageUrl(src: string) {
++  return `/uploads${src}`
++}
++
++async function getFileList() {
++  loading.value = true
++  await getUserImagesList<Common.ListResponse<File.Info[]>>({ page: 1, pageSize: 100 }).finally(() => {
++    loading.value = false
++  }).then((res) => {
++    imageList.value = res.data.list
++  }).catch((e) => {
++    ms.error(e?.msg || String(e))
++  })
++}
++
++async function copyImageUrl(text: string) {
++  const res = await copyToClipboard(text)
++  if (res)
++    ms.success(t('apps.gallery.copyLink'))
++  else
++    ms.error(t('apps.gallery.copyLink'))
++}
++
++function handleSetWallpaper(item: File.Info) {
++  if (item.id === undefined)
++    return
++  updateGalleryFileType({ id: item.id, type: 1 }).then(() => {
++    ms.success(t('common.success'))
++    getFileList()
++  }).catch(e => ms.error(e?.msg || String(e)))
++}
++
++function handleDelete(item: File.Info) {
++  if (item.id === undefined)
++    return
++  dialog.warning({
++    title: t('common.warning'),
++    content: t('common.deleteConfirm'),
++    positiveText: t('common.confirm'),
++    negativeText: t('common.cancel'),
++    onPositiveClick: () => {
++      deleteFiles([item.id as number]).then(() => {
++        ms.success(t('common.deleteSuccess'))
++        getFileList()
++      }).catch(e => ms.error(e?.msg || String(e)))
++    },
++  })
++}
++
++function showInfo(item: File.Info) {
++  infoModalState.value = { show: true, title: t('apps.uploadsFileManager.infoTitle'), fileInfo: item }
++}
++
++onMounted(() => {
++  getFileList()
++})
++</script>
++
++<template>
++  <div class="p-2 h-full">
++    <NAlert type="info" :bordered="false">
++      {{ $t('apps.uploadsFileManager.alertText') }}
++    </NAlert>
++
++    <NSpin :show="loading">
++      <div v-if="imageList.length === 0 && !loading" class="flex justify-center items-center h-[60vh]">
++        {{ $t('apps.gallery.empty') }}
++      </div>
++      <div v-else class="grid gap-2 p-2" style="grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));">
++        <div v-for="item in imageList" :key="item.id" class="flex flex-col justify-end mb-2 gap-2">
++          <NImage
++            :src="imageUrl(item.src)"
++            lazy
++            class="rounded-lg"
++            object-fit="cover"
++            style="width: 100%; height: 100px;"
++            @click="showInfo(item)"
++          />
++          <div class="text-xs truncate" :title="item.fileName">
++            {{ item.fileName }}
++          </div>
++          <div class="flex gap-1 flex-wrap">
++            <NButton size="tiny" tertiary @click="handleSetWallpaper(item)">
++              <template #icon>
++                <SvgIcon icon="fa6:solid-image" />
++              </template>
++              {{ $t('apps.gallery.setWallpaper') }}
++            </NButton>
++            <NButton size="tiny" tertiary @click="copyImageUrl(imageUrl(item.src))">
++              <template #icon>
++                <SvgIcon icon="fa6:solid-link" />
++              </template>
++            </NButton>
++            <NButton size="tiny" tertiary type="error" @click="handleDelete(item)">
++              <template #icon>
++                <SvgIcon icon="fa6:solid-trash-can" />
++              </template>
++            </NButton>
++          </div>
++        </div>
++      </div>
++    </NSpin>
++
++    <RoundCardModal v-model:show="infoModalState.show" style="max-width: 300px;" size="small" :title="infoModalState.title">
++      <div class="p-2 flex flex-col gap-2">
++        <div class="flex justify-between">
++          <span>{{ $t('apps.uploadsFileManager.fileName') }}</span>
++          <span class="truncate max-w-[180px]" :title="infoModalState.fileInfo?.fileName">{{ infoModalState.fileInfo?.fileName }}</span>
++        </div>
++        <div class="flex justify-between">
++          <span>{{ $t('apps.uploadsFileManager.path') }}</span>
++          <span class="truncate max-w-[180px]">{{ infoModalState.fileInfo?.src }}</span>
++        </div>
++        <div class="flex justify-between">
++          <span>{{ $t('apps.uploadsFileManager.uploadTime') }}</span>
++          <span>{{ timeFormat(infoModalState.fileInfo?.createTime ?? '') }}</span>
++        </div>
++      </div>
++    </RoundCardModal>
++  </div>
++</template>
+--- a/src/components/apps/PublicGallery/index.vue
++++ b/src/components/apps/PublicGallery/index.vue
+@@ -0,0 +1,185 @@
++<script setup lang="ts">
++import { NAlert, NButton, NImage, NSpin, NUpload, useDialog, useMessage } from 'naive-ui'
++import { onMounted, ref } from 'vue'
++import { deletePublicImages, getPublicImagesList, publicGalleryUploadUrl } from '@/api/panel/gallery'
++import { RoundCardModal, SvgIcon } from '@/components/common'
++import { t } from '@/locales'
++import { useAuthStore } from '@/store'
++import { copyToClipboard, timeFormat } from '@/utils/cmn'
++
++const imageList = ref<File.Info[]>([])
++const loading = ref(false)
++const ms = useMessage()
++const dialog = useDialog()
++const authStore = useAuthStore()
++const selected = ref<Map<number, File.Info>>(new Map())
++const infoModalState = ref<{ show: boolean, title: string, fileInfo: File.Info | null }>({
++  show: false,
++  title: '',
++  fileInfo: null,
++})
++
++function imageUrl(src: string) {
++  return `/uploads${src}`
++}
++
++async function getFileList() {
++  loading.value = true
++  await getPublicImagesList<Common.ListResponse<File.Info[]>>({ page: 1, pageSize: 100 }).finally(() => {
++    loading.value = false
++  }).then((res) => {
++    imageList.value = res.data.list
++    selected.value.clear()
++  }).catch((e) => {
++    ms.error(e?.msg || String(e))
++  })
++}
++
++function handleUploadFinish({ event }: { event?: ProgressEvent }) {
++  const target = (event as any)?.target
++  if (!target?.response)
++    return
++  try {
++    const res = JSON.parse(target.response)
++    if (res.code === 0)
++      ms.success(t('apps.publicGallery.uploadSuccess'))
++    else
++      ms.error(res.msg || t('apps.publicGallery.uploadFailed'))
++  }
++  catch {
++    ms.error(t('apps.publicGallery.uploadFailed'))
++  }
++  getFileList()
++}
++
++function isSelected(item: File.Info) {
++  return item.id !== undefined && selected.value.has(item.id)
++}
++
++function toggleSelect(item: File.Info) {
++  if (item.id === undefined)
++    return
++  if (selected.value.has(item.id))
++    selected.value.delete(item.id)
++  else
++    selected.value.set(item.id, item)
++}
++
++function handleDeleteSelected() {
++  const ids = Array.from(selected.value.keys())
++  if (ids.length === 0)
++    return
++  dialog.warning({
++    title: t('common.warning'),
++    content: t('apps.publicGallery.deleteConfirm'),
++    positiveText: t('common.confirm'),
++    negativeText: t('common.cancel'),
++    onPositiveClick: () => {
++      deletePublicImages(ids).then(() => {
++        ms.success(t('common.deleteSuccess'))
++        getFileList()
++      }).catch(e => ms.error(e?.msg || String(e)))
++    },
++  })
++}
++
++async function copyImageUrl(text: string) {
++  const res = await copyToClipboard(text)
++  if (res)
++    ms.success(t('apps.gallery.copyLink'))
++  else
++    ms.error(t('apps.gallery.copyLink'))
++}
++
++function showInfo(item: File.Info) {
++  infoModalState.value = { show: true, title: t('apps.uploadsFileManager.infoTitle'), fileInfo: item }
++}
++
++onMounted(() => {
++  getFileList()
++})
++</script>
++
++<template>
++  <div class="p-2 h-full">
++    <NAlert type="info" :bordered="false">
++      {{ $t('apps.publicGallery.appName') }}
++    </NAlert>
++
++    <div class="flex justify-center gap-2 m-3">
++      <NUpload
++        :action="publicGalleryUploadUrl"
++        name="imgfile"
++        :headers="{ token: authStore.token || '' }"
++        :data="{ type: 3 }"
++        accept=".png,.jpg,.jpeg,.gif,.webp,.svg,.ico,.avif,.heic"
++        :show-file-list="false"
++        @finish="handleUploadFinish"
++      >
++        <NButton type="info">
++          <template #icon>
++            <SvgIcon icon="fa6:solid-cloud-arrow-up" />
++          </template>
++          {{ $t('apps.publicGallery.upload') }}
++        </NButton>
++      </NUpload>
++      <NButton type="error" ghost :disabled="selected.size === 0" @click="handleDeleteSelected">
++        <template #icon>
++          <SvgIcon icon="fa6:solid-trash-can" />
++        </template>
++        {{ $t('common.delete') }} ({{ selected.size }})
++      </NButton>
++    </div>
++
++    <NSpin :show="loading">
++      <div v-if="imageList.length === 0 && !loading" class="flex justify-center items-center h-[60vh]">
++        {{ $t('apps.publicGallery.empty') }}
++      </div>
++      <div v-else class="grid gap-2 p-2" style="grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));">
++        <div v-for="item in imageList" :key="item.id" class="flex flex-col justify-end mb-2 gap-2">
++          <NImage
++            :src="imageUrl(item.src)"
++            lazy
++            class="rounded-lg cursor-pointer"
++            object-fit="cover"
++            style="width: 100%; height: 100px;"
++            :class="isSelected(item) ? 'ring-2 ring-blue-500' : ''"
++            @click="showInfo(item)"
++          />
++          <div class="flex gap-1 flex-wrap">
++            <NButton size="tiny" tertiary @click="toggleSelect(item)">
++              <template #icon>
++                <SvgIcon :icon="isSelected(item) ? 'fa6:solid-square-check' : 'fa6:solid-square'" />
++              </template>
++            </NButton>
++            <NButton size="tiny" tertiary @click.stop="copyImageUrl(imageUrl(item.src))">
++              <template #icon>
++                <SvgIcon icon="fa6:solid-link" />
++              </template>
++            </NButton>
++          </div>
++          <div class="text-xs truncate" :title="item.fileName">
++            {{ item.fileName }} · {{ timeFormat(item.createTime ?? '') }}
++          </div>
++        </div>
++      </div>
++    </NSpin>
++
++    <RoundCardModal v-model:show="infoModalState.show" style="max-width: 300px;" size="small" :title="infoModalState.title">
++      <div class="p-2 flex flex-col gap-2">
++        <div class="flex justify-between">
++          <span>{{ $t('apps.uploadsFileManager.fileName') }}</span>
++          <span class="truncate max-w-[180px]" :title="infoModalState.fileInfo?.fileName">{{ infoModalState.fileInfo?.fileName }}</span>
++        </div>
++        <div class="flex justify-between">
++          <span>{{ $t('apps.uploadsFileManager.path') }}</span>
++          <span class="truncate max-w-[180px]">{{ infoModalState.fileInfo?.src }}</span>
++        </div>
++        <div class="flex justify-between">
++          <span>{{ $t('apps.uploadsFileManager.uploadTime') }}</span>
++          <span>{{ timeFormat(infoModalState.fileInfo?.createTime ?? '') }}</span>
++        </div>
++      </div>
++    </RoundCardModal>
++  </div>
++</template>
+--- a/src/components/apps/BackupMigration/index.vue
++++ b/src/components/apps/BackupMigration/index.vue
+@@ -0,0 +1,134 @@
++<script setup lang="ts">
++import { NAlert, NButton, NUpload, useDialog, useMessage } from 'naive-ui'
++import type { UploadFileInfo } from 'naive-ui'
++import { ref } from 'vue'
++import { backupCreate, backupDownloadUrl, backupRecovery, backupUploadZipUrl } from '@/api/panel/gallery'
++import { SvgIcon } from '@/components/common'
++import { t } from '@/locales'
++import { useAuthStore } from '@/store'
++
++const ms = useMessage()
++const dialog = useDialog()
++const authStore = useAuthStore()
++const backing = ref(false)
++const restoring = ref(false)
++
++function downloadBackup(fileName: string) {
++  fetch(`${backupDownloadUrl}?fileName=${encodeURIComponent(fileName)}`, {
++    headers: { token: authStore.token || '' },
++  }).then(res => res.blob()).then((blob) => {
++    const url = window.URL.createObjectURL(blob)
++    const a = document.createElement('a')
++    a.href = url
++    a.download = fileName
++    document.body.appendChild(a)
++    a.click()
++    document.body.removeChild(a)
++    window.URL.revokeObjectURL(url)
++  })
++}
++
++function handleBackup() {
++  backing.value = true
++  backupCreate<{ fileName: string }>().then((res) => {
++    if (res.data.fileName) {
++      ms.success(t('apps.backupMigration.backupSuccess'))
++      downloadBackup(res.data.fileName)
++    }
++  }).catch(e => ms.error(e?.msg || t('apps.backupMigration.backupFailed'))).finally(() => {
++    backing.value = false
++  })
++}
++
++function doRecovery(fileName: string, force: boolean) {
++  restoring.value = true
++  backupRecovery<{ fileName: string }>({ fileName, force }).then(() => {
++    ms.success(t('apps.backupMigration.restoreSuccess'), { duration: 10000 })
++    window.location.href = '/#/clear'
++    window.location.reload()
++  }).catch((e: any) => {
++    // 版本较新但兼容：弹确认后强制恢复
++    if (e?.data?.lowestSunPanelVersion) {
++      dialog.warning({
++        title: t('common.warning'),
++        content: t('apps.backupMigration.restoreVersionConfirm', {
++          backupVersion: e.data.lowestSunPanelVersion,
++          lowestSunPanelVersion: e.data.lowestSunPanelVersion,
++        }),
++        positiveText: t('common.continue'),
++        negativeText: t('common.cancel'),
++        onPositiveClick: () => {
++          restoring.value = true
++          doRecovery(fileName, true)
++        },
++      })
++    }
++    else {
++      ms.error(`${t('apps.backupMigration.restoreFailed')}: ${e?.msg || e}`)
++    }
++  }).finally(() => {
++    restoring.value = false
++  })
++}
++
++function handleUploadFinish({ event }: { event?: ProgressEvent }) {
++  const target = (event as any)?.target
++  if (!target?.response)
++    return
++  try {
++    const res = JSON.parse(target.response)
++    if (res.code === 0 && res.data.fileName)
++      doRecovery(res.data.fileName, false)
++    else
++      ms.error(res.msg || t('apps.backupMigration.restoreFailed'))
++  }
++  catch {
++    ms.error(t('apps.backupMigration.restoreFailed'))
++  }
++}
++
++function beforeUpload({ file }: { file: UploadFileInfo }) {
++  restoring.value = true
++  if (!file.name?.toLowerCase().endsWith('.zip')) {
++    ms.error(t('apps.backupMigration.restoreFailed'))
++    restoring.value = false
++    return false
++  }
++  return true
++}
++</script>
++
++<template>
++  <div class="p-2 h-full">
++    <NAlert type="warning" :bordered="false">
++      {{ $t('apps.backupMigration.tip') }}
++    </NAlert>
++
++    <div class="flex flex-col items-center gap-[30px] m-[40px]">
++      <NButton type="info" size="large" :loading="backing" @click="handleBackup">
++        <template #icon>
++          <SvgIcon icon="fa6:solid-file-zipper" />
++        </template>
++        {{ $t('apps.backupMigration.backup') }}
++      </NButton>
++
++      <NUpload
++        :action="backupUploadZipUrl"
++        name="imgfile"
++        :headers="{ token: authStore.token || '' }"
++        accept=".zip"
++        directory-dnd
++        :show-file-list="false"
++        :before-upload="beforeUpload"
++        @finish="handleUploadFinish"
++      >
++        <NButton type="warning" size="large" :loading="restoring">
++          <template #icon>
++            <SvgIcon icon="eos-icons:database-migration" />
++          </template>
++          {{ $t('apps.backupMigration.restore') }}
++        </NButton>
++      </NUpload>
++    </div>
++  </div>
++</template>
+--- a/src/utils/cmn/builtInApps.ts
++++ b/src/utils/cmn/builtInApps.ts
+@@ -43,6 +43,12 @@
+     iconSrc: ItemGroupManageSvg,
+   },
+   {
++    name: t('common.gallery'),
++    componentName: 'Gallery',
++    icon: 'material-symbols:gallery-thumbnail-outline',
++    iconSrc: UploadFileManagerSvg,
++  },
++  {
+     name: 'Docker',
+     componentName: 'DockerManage',
+     icon: 'tabler-brand-docker',
+@@ -75,6 +81,13 @@
+     iconSrc: OpenAPISvg,
+   },
+   {
++    name: t('common.publicGallery'),
++    componentName: 'PublicGallery',
++    icon: 'material-symbols:gallery-thumbnail-outline',
++    roles: [1],
++    iconSrc: UploadFileManagerSvg,
++  },
++  {
+     name: t('apps.globalSetting.appName'),
+     componentName: 'GlobalSetting',
+     icon: 'ic:outline-build-circle',
+@@ -91,6 +104,14 @@
+   },
+ 
+   {
++    name: t('apps.backupMigration.appName'),
++    componentName: 'BackupMigration',
++    icon: 'eos-icons:database-migration',
++    roles: [1],
++    iconSrc: OpenAPISvg,
++  },
++
++  {
+     name: t('apps.about.appName'),
+     componentName: 'About',
+     icon: 'lucide:info',
+--- a/src/locales/zh-CN.json
++++ b/src/locales/zh-CN.json
+@@ -230,6 +230,36 @@
+         "dark": "深色 ",
+         "light": "浅色 "
+       }
++    },
++    "gallery": {
++      "appName": "图库",
++      "setWallpaper": "设为壁纸",
++      "copyLink": "复制链接",
++      "empty": "还没有图片，去上传或设置壁纸吧",
++      "upload": "上传图片"
++    },
++    "publicGallery": {
++      "appName": "公开图库",
++      "upload": "上传到公开图库",
++      "empty": "公开图库还没有图片",
++      "deleteConfirm": "确认从公开图库删除所选图片？",
++      "uploadSuccess": "上传成功",
++      "uploadFailed": "上传失败"
++    },
++    "backupMigration": {
++      "appName": "迁移",
++      "tip": "备份包含：上传文件、自定义样式、SQLite 数据库。恢复会覆盖当前数据，请提前手动备份重要数据。",
++      "backup": "立即备份",
++      "backupSuccess": "备份完成，已开始下载",
++      "restore": "上传备份包恢复",
++      "restoreConfirm": "恢复将覆盖当前全部数据（面板、用户、上传文件），确认继续？",
++      "restoreSuccess": "恢复完成，请刷新页面并重新登录",
++      "restoreVersionConfirm": "该备份由更新版本({backupVersion})生成，但兼容当前版本（最低支持 {lowestSunPanelVersion}）。是否强制恢复？",
++      "uploading": "上传中…",
++      "backing": "备份中…",
++      "restoring": "恢复中…",
++      "restoreFailed": "恢复失败",
++      "backupFailed": "备份失败"
+     }
+   },
+   "common": {
+@@ -306,7 +336,9 @@
+     "viewReason": "查看原因",
+     "viewSolution": "查看解决方案",
+     "warning": "警告",
+-    "yes": "是"
++    "yes": "是",
++    "gallery": "图库",
++    "publicGallery": "公开图库"
+   },
+   "components": {
+     "pwaReloadPrompt": {
+--- a/src/locales/en-US.json
++++ b/src/locales/en-US.json
+@@ -230,6 +230,36 @@
+         "dark": "Dark ",
+         "light": "Light "
+       }
++    },
++    "gallery": {
++      "appName": "Gallery",
++      "setWallpaper": "Set as wallpaper",
++      "copyLink": "Copy link",
++      "empty": "No images yet",
++      "upload": "Upload"
++    },
++    "publicGallery": {
++      "appName": "Public Gallery",
++      "upload": "Upload to public gallery",
++      "empty": "No public images yet",
++      "deleteConfirm": "Delete selected images from public gallery?",
++      "uploadSuccess": "Upload succeeded",
++      "uploadFailed": "Upload failed"
++    },
++    "backupMigration": {
++      "appName": "Migration",
++      "tip": "Backup includes: uploads, custom styles and the SQLite database. Restoring overwrites current data.",
++      "backup": "Backup now",
++      "backupSuccess": "Backup done, download started",
++      "restore": "Upload backup to restore",
++      "restoreConfirm": "Restoring will overwrite ALL current data (panel, users, uploads). Continue?",
++      "restoreSuccess": "Restore done, please refresh and sign in again",
++      "restoreVersionConfirm": "This backup was made by a newer version ({backupVersion}) but is compatible (lowest {lowestSunPanelVersion}). Force restore?",
++      "uploading": "Uploading…",
++      "backing": "Backing up…",
++      "restoring": "Restoring…",
++      "restoreFailed": "Restore failed",
++      "backupFailed": "Backup failed"
+     }
+   },
+   "common": {
+@@ -306,7 +336,9 @@
+     "viewReason": "View Reason",
+     "viewSolution": "View solutions",
+     "warning": "Warning",
+-    "yes": "Yes"
++    "yes": "Yes",
++    "gallery": "Gallery",
++    "publicGallery": "Public Gallery"
+   },
+   "components": {
+     "pwaReloadPrompt": {
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -47,6 +47,9 @@
+ # run_image
+ FROM alpine
+ 
++# 先装包再 COPY，避免后续 RUN 层把大文件重复打包
++RUN apk add --no-cache bash ca-certificates su-exec tzdata
++
+ WORKDIR /app
+ 
+ COPY --from=web_image /build/dist /app/web
+@@ -58,8 +61,6 @@
+ 
+ EXPOSE 3002
+ 
+-RUN apk add --no-cache bash ca-certificates su-exec tzdata \
+-    && chmod +x ./sun-panel \
+-    && ./sun-panel -config-reset
++RUN ./sun-panel -config-reset
+ 
+ CMD ./sun-panel

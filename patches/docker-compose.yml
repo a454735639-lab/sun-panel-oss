@@ -1,0 +1,14 @@
+services:
+  sun-panel:
+    image: sun-panel:1.8.1-oss
+    container_name: sun-panel
+    restart: unless-stopped
+    ports:
+      - "3002:3002"
+    volumes:
+      - ./conf:/app/conf
+      - ./runtime:/app/runtime
+      # Docker 卡片需要（按需打开）
+      # - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=Asia/Shanghai
