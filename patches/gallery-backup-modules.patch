@@ -1934,6 +1934,15 @@
      "pwaReloadPrompt": {
 --- a/Dockerfile
 +++ b/Dockerfile
+@@ -4,7 +4,7 @@
+ # 华为源
+ # RUN npm config set registry https://repo.huaweicloud.com/repository/npm/
+ 
+-RUN npm install pnpm -g
++RUN npm install pnpm@9 -g
+ 
+ WORKDIR /build
+ 
 @@ -47,6 +47,9 @@
  # run_image
  FROM alpine
