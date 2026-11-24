@@ -207,8 +207,13 @@ func (a *Container) GetContainersState(c *gin.Context) {
 
 	for _, v := range reqIds {
 		if cached, ok := containerStatsCache.Load(v); ok {
-			if entry, ok := cached.(cachedContainerStats); ok && now.Sub(entry.at) < containerStatsCacheTTL {
+			if entry, ok := cached.(cachedContainerStats); ok {
+				// 有缓存就先返回，过期则后台异步刷新（stale-while-revalidate），
+				// 保证前端轮询永远不会卡在 docker daemon 上
 				resp[v] = entry.data
+				if now.Sub(entry.at) >= containerStatsCacheTTL {
+					go refreshContainerStats(v)
+				}
 				continue
 			}
 		}
@@ -232,14 +237,35 @@ func (a *Container) GetContainersState(c *gin.Context) {
 	apiReturn.SuccessData(c, resp)
 }
 
+// refreshContainerStats 后台刷新单个容器的统计（同一容器同时只允许一个刷新任务）
+func refreshContainerStats(containerID string) {
+	if _, loaded := containerStatsRefreshing.LoadOrStore(containerID, struct{}{}); loaded {
+		return
+	}
+	defer containerStatsRefreshing.Delete(containerID)
+
+	select {
+	case containerStateSem <- struct{}{}:
+		defer func() { <-containerStateSem }()
+	default:
+		return // 后台任务过多时丢弃本次刷新，下次轮询再来
+	}
+
+	state := collectContainerState(containerID)
+	containerStatsCache.Store(containerID, cachedContainerStats{data: state, at: time.Now()})
+}
+
+var containerStateSem = make(chan struct{}, 4)
+
 type cachedContainerStats struct {
 	data dockerApiStructs.ContainerStats
 	at   time.Time
 }
 
 var (
-	containerStatsCache    sync.Map
-	containerStatsCacheTTL = 5 * time.Second
+	containerStatsCache      sync.Map
+	containerStatsRefreshing sync.Map
+	containerStatsCacheTTL   = 10 * time.Second
 )
 
 // collectContainerState 采集单个容器的运行状态与资源用量
